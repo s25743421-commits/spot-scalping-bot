@@ -2,15 +2,15 @@ import ccxt
 import pandas as pd
 import requests
 import time
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
 
 # ================= CONFIG =================
+
 TIMEFRAME = '5m'
 CANDLES = 50
 SCAN_DELAY = 60  # seconds
-COOLDOWN_MINUTES = 45
-
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1457653912117968926/whuCLJwUQIgDR3Kqm-AZqZWv0Md0zkhr6bAfZKkomKiXfxDemKYiSGqAliDAAgZ0R0di"
+COOLDOWN_MINUTES = 30
 
 PAIRS = [
     'BTC/USDT',
@@ -21,96 +21,104 @@ PAIRS = [
     'AVAX/USDT',
     'OP/USDT'
 ]
-# =========================================
 
-exchange = ccxt.bybit()
+DISCORD_WEBHOOK_URL = os.getenv("https://discord.com/api/webhooks/1457674224763146404/rxZI9rgKmo2_LMDv7W2sWJvSpJoZwrmYp3YX9hZC1ZgUmMGefILl4b5n94rgn0yxRH4e")
+
+# ================= INIT =================
+
+exchange = ccxt.bybit({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'}
+})
+
 last_signal_time = {}
 
-def send_discord(msg):
-    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+print("🚀 Spot Scalping Bot Started...")
+
+# ================= FUNCTIONS =================
+
+def send_discord(message):
+    if not DISCORD_WEBHOOK_URL:
+        print("❌ Discord webhook missing")
+        return
+    payload = {"content": message}
+    requests.post(DISCORD_WEBHOOK_URL, json=payload)
 
 def in_cooldown(pair):
     if pair not in last_signal_time:
         return False
-    return datetime.now() < last_signal_time[pair] + timedelta(minutes=COOLDOWN_MINUTES)
+    diff = datetime.utcnow() - last_signal_time[pair]
+    return diff.total_seconds() < COOLDOWN_MINUTES * 60
 
-def analyze_pair(pair):
-    ohlcv = exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=CANDLES)
-    df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','vol'])
+def fetch_data(pair):
+    candles = exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=CANDLES)
+    df = pd.DataFrame(candles, columns=['time','open','high','low','close','volume'])
+    return df
 
+def liquidity_sweep(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
+    return last['low'] < prev['low'] and last['close'] > prev['open']
 
-    # ---- BASIC MARKET FILTER ----
-    if last['high'] - last['low'] == 0:
+def strong_bullish_close(df):
+    last = df.iloc[-1]
+    body = abs(last['close'] - last['open'])
+    range_ = last['high'] - last['low']
+    return body > range_ * 0.6 and last['close'] > last['open']
+
+def generate_signal(pair):
+    df = fetch_data(pair)
+
+    if not liquidity_sweep(df):
         return None
 
-    # ---- BUY REJECTION LOGIC ----
-    bullish_rejection = (
-        last['close'] > last['open'] and
-        last['low'] < prev['low']
-    )
-
-    if not bullish_rejection:
+    if not strong_bullish_close(df):
         return None
 
-    # ---- ENTRY ZONE ----
-    entry_low = min(last['open'], last['close'])
-    entry_high = max(last['open'], last['close'])
+    entry = df.iloc[-1]['close']
+    recent_low = df['low'].tail(10).min()
+    recent_high = df['high'].tail(10).max()
 
-    # ---- SMART SL ----
-    candle_range = last['high'] - last['low']
-    sl = last['low'] - (candle_range * 0.35)
-
-    # ---- TP (1.3R) ----
-    risk = entry_low - sl
-    tp = entry_high + (risk * 1.3)
-
-    # ---- CONFIDENCE SCORE ----
-    confidence = "HIGH" if candle_range > df['high'].sub(df['low']).mean() else "MEDIUM"
+    sl = round(recent_low * 0.998, 4)
+    tp = round(entry + (entry - sl) * 1.5, 4)
 
     return {
         "pair": pair,
-        "entry_low": entry_low,
-        "entry_high": entry_high,
+        "entry": round(entry, 4),
         "sl": sl,
-        "tp": tp,
-        "confidence": confidence
+        "tp": tp
     }
 
 # ================= MAIN LOOP =================
-print("🚀 Spot Scalping Bot Started...")
 
 while True:
     for pair in PAIRS:
-
-        if in_cooldown(pair):
-            continue
-
         try:
-            signal = analyze_pair(pair)
+            if in_cooldown(pair):
+                continue
+
+            signal = generate_signal(pair)
 
             if signal:
-                msg = f"""
-📈 SPOT BUY SIGNAL
-
-PAIR: {signal['pair']}
-ENTRY ZONE: {signal['entry_low']:.2f} – {signal['entry_high']:.2f}
-STOP LOSS: {signal['sl']:.2f}
-TAKE PROFIT: {signal['tp']:.2f}
-CONFIDENCE: {signal['confidence']}
-TIMEFRAME: {TIMEFRAME}
-
-NOTE:
-Liquidity sweep + bullish rejection.
-Risk max 1% per trade.
-"""
+                msg = (
+                    f"📊 **SPOT BUY SIGNAL**\n\n"
+                    f"PAIR: {signal['pair']}\n"
+                    f"ENTRY: {signal['entry']}\n"
+                    f"TP: {signal['tp']}\n"
+                    f"SL: {signal['sl']}\n\n"
+                    f"⏱ TF: {TIMEFRAME}\n"
+                    f"🎯 Logic: PA + Liquidity\n"
+                )
 
                 send_discord(msg)
-                last_signal_time[pair] = datetime.now()
-                print(f"✅ Signal sent: {pair}")
+                last_signal_time[pair] = datetime.utcnow()
+                print(f"✅ Signal sent for {pair}")
+
+            else:
+                print(f"No valid setup on {pair}")
 
         except Exception as e:
             print(f"⚠️ Error on {pair}: {e}")
 
     time.sleep(SCAN_DELAY)
+
